@@ -18,5 +18,7 @@ public enum FileType {
     MISC,
     SERIALIZATION,
     HTTP,
-    USERHOOKS
+    USERHOOKS,
+    APP_STRUCT,
+    REPLACEMENT
 }

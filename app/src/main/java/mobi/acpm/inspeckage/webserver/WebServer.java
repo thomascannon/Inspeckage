@@ -8,7 +8,13 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Environment;
+import android.security.KeyPairGeneratorSpec;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
 import android.text.Html;
+import android.util.Log;
+
+import org.java_websocket.util.Base64;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -16,12 +22,27 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
+import java.math.BigInteger;
+import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.UnrecoverableKeyException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
+import javax.net.ssl.KeyManagerFactory;
+import javax.security.auth.x500.X500Principal;
+
+import fi.iki.elonen.NanoHTTPD;
 import mobi.acpm.inspeckage.Module;
 import mobi.acpm.inspeckage.hooks.CryptoHook;
 import mobi.acpm.inspeckage.hooks.FileSystemHook;
@@ -38,9 +59,11 @@ import mobi.acpm.inspeckage.log.LogService;
 import mobi.acpm.inspeckage.receivers.InspeckageWebReceiver;
 import mobi.acpm.inspeckage.util.Config;
 import mobi.acpm.inspeckage.util.FileUtil;
+import mobi.acpm.inspeckage.util.Fingerprint;
 import mobi.acpm.inspeckage.util.PackageDetail;
 import mobi.acpm.inspeckage.util.Util;
 
+import static mobi.acpm.inspeckage.util.FileType.APP_STRUCT;
 import static mobi.acpm.inspeckage.util.FileType.CRYPTO;
 import static mobi.acpm.inspeckage.util.FileType.FILESYSTEM;
 import static mobi.acpm.inspeckage.util.FileType.HASH;
@@ -56,20 +79,123 @@ import static mobi.acpm.inspeckage.util.FileType.WEBVIEW;
 /**
  * Created by acpm on 16/11/15.
  */
-public class WebServer extends NanoHTTPD {
+public class WebServer extends fi.iki.elonen.NanoHTTPD {
 
     private Context mContext;
     private SharedPreferences mPrefs;
+    private KeyStore keyStore;
 
-    public WebServer(int port, Context context) throws IOException {
-        super(port);
+    public WebServer(String host, int port, Context context) throws IOException {
+        super(host,port);
         mContext = context;
-        mPrefs = mContext.getSharedPreferences(Module.PREFS, mContext.MODE_WORLD_READABLE);
+        mPrefs = mContext.getSharedPreferences(Module.PREFS, mContext.MODE_PRIVATE);
 
-        mContext.registerReceiver(new InspeckageWebReceiver(mContext),
-                new IntentFilter("mobi.acpm.inspeckage.INSPECKAGE_WEB"));
+        try {
+            keyStore = KeyStore.getInstance("AndroidKeyStore");
+            keyStore.load(null);
 
-        start();
+            Enumeration<String> aliases = keyStore.aliases();
+            List<String> keyAliases = new ArrayList<>();
+            while (aliases.hasMoreElements()) {
+                keyAliases.add(aliases.nextElement());
+            }
+
+            //use uuid as an alias, that way each installation has your own alias
+            if(mPrefs.getString(Config.KEYPAIR_ALIAS,"").equals("")) {
+                SharedPreferences.Editor edit = mPrefs.edit();
+                edit.putString(Config.KEYPAIR_ALIAS, UUID.randomUUID().toString());
+                edit.apply();
+            }
+
+            String alias = mPrefs.getString(Config.KEYPAIR_ALIAS,"");
+
+            boolean genNewKey = true;
+            for (String key : keyAliases) {
+                if(key.equals(alias)){
+                    genNewKey = false;
+                }
+            }
+            if(genNewKey) {
+                KeyPair keyPair = generateKeys(alias);
+                keyStore = KeyStore.getInstance("AndroidKeyStore");
+                keyStore.load(null);
+            }
+        }
+        catch(Exception e) {
+            Log.e("Error",e.getMessage());
+        }
+
+        if(mPrefs.getBoolean(Config.SP_SWITCH_AUTH, false)) {
+
+            KeyManagerFactory keyManagerFactory = null;
+            try {
+                keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());//
+                keyManagerFactory.init(keyStore, "".toCharArray());
+            } catch (NoSuchAlgorithmException | UnrecoverableKeyException | KeyStoreException e) {
+                e.printStackTrace();
+            }
+
+            makeSecure(NanoHTTPD.makeSSLSocketFactory(keyStore, keyManagerFactory), null);
+        }
+        mContext.registerReceiver(new InspeckageWebReceiver(mContext), new IntentFilter("mobi.acpm.inspeckage.INSPECKAGE_WEB"));
+
+        start(10000);
+    }
+
+    public KeyPair generateKeys(String alias) {
+        KeyPair keyPair = null;
+        try {
+
+            KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA","AndroidKeyStore");
+
+            Calendar start = Calendar.getInstance();
+            Calendar end = Calendar.getInstance();
+            end.add(Calendar.YEAR, 1);
+
+            if (android.os.Build.VERSION.SDK_INT > android.os.Build.VERSION_CODES.M) {
+
+                KeyGenParameterSpec spec= new KeyGenParameterSpec.Builder(
+                        alias,
+                        KeyProperties.PURPOSE_SIGN|KeyProperties.PURPOSE_VERIFY)
+                        .setCertificateSubject(new X500Principal("CN=Inspeckage, OU=ACPM, O=ACPM, C=BR"))
+                        .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
+                        .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
+                        .setCertificateNotBefore(start.getTime())
+                        .setCertificateNotAfter(end.getTime())
+                        .setKeyValidityStart(start.getTime())
+                        .setKeyValidityEnd(end.getTime())
+                        .setKeySize(2048)
+                        .setCertificateSerialNumber(BigInteger.valueOf(1))
+                        .build();
+
+                keyGen.initialize(spec);
+            }else {
+
+                KeyPairGeneratorSpec spec = new KeyPairGeneratorSpec.Builder(mContext)
+                        .setAlias(alias)
+                        .setSubject(new X500Principal("CN=Inspeckage, OU=ACPM, O=ACPM, C=BR"))
+                        .setSerialNumber(BigInteger.valueOf(12345))
+                        .setStartDate(start.getTime())
+                        .setEndDate(end.getTime())
+                        .build();
+
+
+                keyGen.initialize(spec);
+            }
+
+            keyPair = keyGen.generateKeyPair();
+        } catch(GeneralSecurityException e) {
+            Log.d("Inspeckage_Exception: ",e.getMessage());
+        }
+        return keyPair;
+    }
+
+    private Response ok(String type, String html, String cacheTime) {
+
+        Response response = newFixedLengthResponse(Response.Status.OK, type, html);
+        response.addHeader("Cache-Control", "public");
+        response.addHeader("Cache-Control", "max-age="+cacheTime);
+        return response;
     }
 
     private Response ok(String type, String html) {
@@ -84,6 +210,28 @@ public class WebServer extends NanoHTTPD {
     public Response serve(IHTTPSession session) {
 
         String uri = session.getUri();
+
+        if(mPrefs.getBoolean(Config.SP_SWITCH_AUTH, false)) {
+            Map<String, String> headers = session.getHeaders();
+
+            String authorization = headers.get("authorization");
+            String base64 = "";
+            if (authorization != null) {
+                base64 = authorization.substring(6);
+            }
+
+            boolean logged = false;
+            if (base64.equals(Base64.encodeBytes(mPrefs.getString(Config.SP_USER_PASS, "").getBytes()))) {
+                logged = true;
+            }
+
+            if (!logged) {
+                Response res = newFixedLengthResponse(Response.Status.UNAUTHORIZED, NanoHTTPD.MIME_HTML, "Denied!");
+                res.addHeader("WWW-Authenticate", "Basic realm=\"Server\"");
+                res.addHeader("Content-Length", "0");
+                return res;
+            }
+        }
 
         //add ip and port to proxy fields
         if (mPrefs.getString(Config.SP_PROXY_HOST, "").equals("")) {
@@ -155,9 +303,33 @@ public class WebServer extends NanoHTTPD {
                         break;
                     case "adduserhooks":
                         return addUserHooks(parms);
+                    case "addparamreplaces":
+                        return addUserReplaces(parms);
+                    case "addreturnreplaces":
+                        return addUserReturnReplaces(parms);
                     case "getuserhooks":
                         return getUserHooks();
-
+                    case "getparamreplaces":
+                        return getUserReplaces();
+                    case "getreturnreplaces":
+                        return getUserReturnReplaces();
+                    case "getbuild":
+                        return getBuild();
+                    case "addbuild":
+                        return addBuild(parms);
+                    case "deleteLogs":
+                        return clearHooksLog(parms);
+                    case "enableTab":
+                        html = tabsCheckbox(parms);
+                        break;
+                    case "clipboard":
+                        return addToClipboard(parms);
+                    case "location":
+                        return addLocation(parms);
+                    case "geolocationSwitch":
+                        return geoLocSwitch(parms);
+                    case "resetfingerprint":
+                        return resetFingerprint();
                 }
             } else {
                 html = setDefaultOptions();
@@ -173,21 +345,40 @@ public class WebServer extends NanoHTTPD {
             html = html.replace("#ip_ws#", mPrefs.getString(Config.SP_SERVER_IP, "127.0.0.1"));
             html = html.replace("#port_ws#", String.valueOf(mPrefs.getInt(Config.SP_WSOCKET_PORT, 8887)));
             return ok(html);
+        } else if (uri.contains("/content/")) {
+
+            html = FileUtil.readHtmlFile(mContext, uri);
+
+            if (uri.contains("location.html")) {
+                html = html.replace("#savedLoc#", mPrefs.getString(Config.SP_GEOLOCATION, ""));
+
+                if (mPrefs.getBoolean(Config.SP_GEOLOCATION_SW, false)) {
+                    html = html.replace("#switchLoc#", "<input type='checkbox' name='savedLoc' data-size='mini' checked>");
+                }else {
+                    html = html.replace("#switchLoc#", "<input type='checkbox' name='savedLoc' data-size='mini' unchecked>");
+                }
+            }
+
+        } else if (uri.equals("/struct")) {
+
+            String json = FileUtil.readFromFile(mPrefs, APP_STRUCT);//readHtmlFile(mContext, uri);
+            return ok("text/json", json);
+
         } else {
 
             String fname = FileUtil.readHtmlFile(mContext, uri);
 
             if (uri.contains(".css")) {
-                return ok("text/css", fname);
+                return ok("text/css", fname, "86400");
             }
             if (uri.contains(".js")) {
-                return ok("text/javascript", fname);
+                return ok("text/javascript", fname, "86400");
             }
             if (uri.contains(".png")) {
                 try {
                     InputStream f = mContext.getAssets().open("HTMLFiles" + uri);
-
-                    return new Response(Response.Status.OK, "image/png", f, f.available());
+                    return newChunkedResponse(Response.Status.OK, "image/png", f);
+                    //return new Response(Response.Status.OK, "image/png", f, f.available());
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
@@ -206,7 +397,7 @@ public class WebServer extends NanoHTTPD {
                 return ok("application/x-font-ttf", fname);
             }
             if (uri.contains(".woff")) {
-                return ok("font/x-woff", fname);
+                return ok("application/font-woff", fname);
             }
             if (uri.contains(".woff2")) {
                 return ok("font/woff2", fname);
@@ -257,6 +448,54 @@ public class WebServer extends NanoHTTPD {
         fileTree();
 
         return FileUtil.readHtmlFile(mContext, "/index.html");
+    }
+
+    private String tabsCheckbox(Map<String, String> parms) {
+        String tab = parms.get("tab");
+        if (tab != null) {
+            String state = parms.get("value");
+            SharedPreferences.Editor edit = mPrefs.edit();
+
+            switch (tab){
+                case "shared":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_SHAREDP, Boolean.valueOf(state));
+                    break;
+                case "serialization":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_SERIALIZATION, Boolean.valueOf(state));
+                    break;
+                case "crypto":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_CRYPTO, Boolean.valueOf(state));
+                    break;
+                case "hash":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_HASH, Boolean.valueOf(state));
+                    break;
+                case "sqlite":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_SQLITE, Boolean.valueOf(state));
+                    break;
+                case "http":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_HTTP, Boolean.valueOf(state));
+                    break;
+                case "filesystem":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_FS, Boolean.valueOf(state));
+                    break;
+                case "misc":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_MISC, Boolean.valueOf(state));
+                    break;
+                case "webview":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_WV, Boolean.valueOf(state));
+                    break;
+                case "ipc":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_IPC, Boolean.valueOf(state));
+                    break;
+                case "phooks":
+                    edit.putBoolean(Config.SP_TAB_ENABLE_PHOOKS, Boolean.valueOf(state));
+                    break;
+
+            }
+            edit.apply();
+
+        }
+        return "#tab_scheckbox#";
     }
 
     private String sslUnpinning(Map<String, String> parms) {
@@ -333,8 +572,16 @@ public class WebServer extends NanoHTTPD {
     private String fileHtml(Map<String, String> parms) {
         String value = parms.get("value");
 
+        int count = 0;
+
+        String c = parms.get("count");
+        if (c == null || c.equals("")) {
+            c = "0";
+        }
+        count = Integer.valueOf(c);
+
         if (value != null && !value.trim().equals("")) {
-            return hooksContent(value);
+            return hooksContent(value, count);
         }
         return "";
     }
@@ -372,6 +619,18 @@ public class WebServer extends NanoHTTPD {
         String mac = parms.get("mac");
         Util.setARPEntry(ip, mac);
         Util.showNotification(mContext, "arp -s " + ip + " " + mac + "");
+
+        return ok("OK");
+    }
+
+    private Response addToClipboard(Map<String, String> parms) {
+        String value = parms.get("value");
+
+        Intent intent = new Intent("mobi.acpm.inspeckage.INSPECKAGE_WEB");
+        intent.putExtra("package", mPrefs.getString(Config.SP_PACKAGE, ""));
+        intent.putExtra("value", value);
+        intent.putExtra("action", "clipboard");
+        mContext.sendBroadcast(intent, null);
 
         return ok("OK");
     }
@@ -423,10 +682,125 @@ public class WebServer extends NanoHTTPD {
         return ok("OK");
     }
 
+    private Response addUserReplaces(Map<String, String> parms) {
+
+        String json = parms.get("data");
+        SharedPreferences.Editor edit = mPrefs.edit();
+        edit.putString(Config.SP_USER_REPLACES, json);
+        edit.apply();
+
+        return ok("OK");
+    }
+
+    private Response addUserReturnReplaces(Map<String, String> parms) {
+
+        String json = parms.get("data");
+        SharedPreferences.Editor edit = mPrefs.edit();
+        edit.putString(Config.SP_USER_RETURN_REPLACES, json);
+        edit.apply();
+
+        return ok("OK");
+    }
+
     private Response getUserHooks() {
 
         String json = mPrefs.getString(Config.SP_USER_HOOKS,"");
-        return ok("text/json",json);
+        return ok("text/json", json);
+    }
+
+    private Response getUserReplaces() {
+
+        String json = mPrefs.getString(Config.SP_USER_REPLACES,"");
+        return ok("text/json", json);
+    }
+
+    private Response getUserReturnReplaces() {
+
+        String json = mPrefs.getString(Config.SP_USER_RETURN_REPLACES,"");
+        return ok("text/json", json);
+    }
+
+    private Response getBuild() {
+        if(mPrefs.getString(Config.SP_FINGERPRINT_HOOKS,"").equals("")) {
+            Fingerprint.getInstance(mContext).load();
+        }
+
+        String json = mPrefs.getString(Config.SP_FINGERPRINT_HOOKS,"");
+        json = json.replace("{\"fingerprintItems\":[{","[{");
+        json = json.replace("\"}]}","\"}]");
+        return ok("text/json", json);
+    }
+
+    private Response resetFingerprint() {
+
+        Fingerprint.getInstance(mContext).load();
+
+        String json = mPrefs.getString(Config.SP_FINGERPRINT_HOOKS, "");
+        json = json.replace("{\"fingerprintItems\":[{", "[{");
+        json = json.replace("\"}]}", "\"}]");
+        return ok("text/json", json);
+    }
+
+    private Response addBuild(Map<String, String> parms) {
+
+        String json = parms.get("build");
+        json = "{\"fingerprintItems\":"+json+"}";
+        SharedPreferences.Editor edit = mPrefs.edit();
+        edit.putString(Config.SP_FINGERPRINT_HOOKS, json);
+        edit.apply();
+
+        return ok("OK");
+    }
+
+    private Response clearHooksLog(Map<String, String> parms) {
+
+        String hook = parms.get("value");
+
+        String appPath = Environment.getExternalStorageDirectory().getAbsolutePath();
+        if (!mPrefs.getBoolean(Config.SP_HAS_W_PERMISSION, false)) {
+            appPath = mPrefs.getString(Config.SP_DATA_DIR, "");
+        }
+
+        String path = "";
+        switch (hook) {
+            case "userhooks":
+                path = Config.P_USERHOOKS;
+                break;
+            case "misc":
+                path = Config.P_MISC;
+                break;
+            case "webview":
+                path = Config.P_WEBVIEW;
+                break;
+            case "http":
+                path = Config.P_HTTP;
+                break;
+            case "fs":
+                path = Config.P_FILESYSTEM;
+                break;
+            case "ipc":
+                path = Config.P_IPC;
+                break;
+            case "sqlite":
+                path = Config.P_SQLITE;
+                break;
+            case "hash":
+                path = Config.P_HASH;
+                break;
+            case "crypto":
+                path = Config.P_CRYPTO;
+                break;
+            case "serialization":
+                path = Config.P_SERIALIZATION;
+                break;
+            case "prefs":
+                path = Config.P_PREFS;
+                break;
+        }
+
+        File root = new File(appPath + Config.P_ROOT + path);
+        FileUtil.deleteFile(root);
+        return ok("ok");
     }
 
     private String replaceHtmlVariables(String html) {
@@ -434,6 +808,7 @@ public class WebServer extends NanoHTTPD {
         html = html.replace("#flags#", flagSecureCheckbox());
         html = html.replace("#sslunpinning#", SSLUnpinningCheckbox());
         html = html.replace("#exported#", exportedCheckbox());
+        html = html.replace("#tab_scheckbox#", tabsCheckbox());
         html = html.replace("#exported_act#", htmlExportedActivities());
         html = html.replace("#activities_list#", htmlActivityList());
         html = html.replace("#exported_provider#", htmlExportedProviders());
@@ -442,12 +817,16 @@ public class WebServer extends NanoHTTPD {
         html = html.replace("#exported_broadcast#", htmlExportedBroadcasts());
 
         html = html.replace("#appName#", mPrefs.getString(Config.SP_APP_NAME, "AppName"));
+
+        String icon = "<img src=\"data:image/png;base64, "+mPrefs.getString(Config.SP_APP_ICON_BASE64, "AppIcon")+"\" width=\"80\" height=\"80\" />";
+        html = html.replace("#appIcon#", icon);
         html = html.replace("#appVersion#", mPrefs.getString(Config.SP_APP_VERSION, "Version"));
         html = html.replace("#uid#", mPrefs.getString(Config.SP_UID, "uid"));
         html = html.replace("#gids#", mPrefs.getString(Config.SP_GIDS, "GIDs"));
         html = html.replace("#package#", mPrefs.getString(Config.SP_PACKAGE, "package"));
         html = html.replace("#data_dir#", mPrefs.getString(Config.SP_DATA_DIR, "Data Path"));
         html = html.replace("#isdebuggable#", mPrefs.getString(Config.SP_DEBUGGABLE, "?"));
+        html = html.replace("#allowbackup#", mPrefs.getString(Config.SP_ALLOW_BACKUP, "?"));
 
         html = html.replace("#non_exported_act#", mPrefs.getString(Config.SP_N_EXP_ACTIVITIES, "Non Exported Activities").replace("\n", "</br>"));
         html = html.replace("#non_exported_services#", mPrefs.getString(Config.SP_N_EXP_SERVICES, "Services").replace("\n", "</br>"));
@@ -458,6 +837,32 @@ public class WebServer extends NanoHTTPD {
         return html;
     }
 
+    private Response addLocation(Map<String, String> parms) {
+
+        String loc = parms.get("geolocation");
+        SharedPreferences.Editor edit = mPrefs.edit();
+        edit.putString(Config.SP_GEOLOCATION, loc);
+        edit.apply();
+        return ok("OK");
+    }
+
+    private Response getLocation() {
+        String loc = mPrefs.getString(Config.SP_GEOLOCATION,"");
+        return ok(loc);
+    }
+
+    private Response geoLocSwitch(Map<String, String> parms) {
+        String geo_switch = parms.get("geolocationSwitch");
+        if (geo_switch != null) {
+            SharedPreferences.Editor edit = mPrefs.edit();
+            edit.putBoolean(Config.SP_GEOLOCATION_SW, Boolean.valueOf(geo_switch));
+            edit.apply();
+            if (Boolean.valueOf(geo_switch)) {
+                Util.showNotification(mContext, "Geolocation ON");
+            }
+        }
+        return ok("OK");
+    }
     //HTML
 
     public String htmlNonExportedProviders() {
@@ -642,10 +1047,14 @@ public class WebServer extends NanoHTTPD {
                     "<h4 class='panel-title'><a role='button' data-toggle='collapse' data-parent='#accordion' href='#collapse" + i + "' " +
                     "aria-expanded='true' aria-controls='collapse" + i + "'> " + k + " </a> </h4> </div> <div id='collapse" + i + "' " +
                     "class='panel-collapse collapse in' role='tabpanel' aria-labelledby='heading" + i + "'> " +
-                    "<div class='panel-body'><xmp>" + v + "</xmp></div> </div> </div>";
+                    "<div class='panel-body'><textarea rows='"+countLines(v)+"' style=\"border:none;width:100%\" readonly>" +v + "</textarea></div> </div> </div>";
         }
 
         return prefs_files;
+    }
+    private static int countLines(String str){
+        String[] lines = str.split("\r\n|\r|\n");
+        return  lines.length+1;
     }
 
     //CONFIG
@@ -679,6 +1088,59 @@ public class WebServer extends NanoHTTPD {
         return flag_s;
     }
 
+    public String tabsCheckbox() {
+        String shared = "<input type='checkbox' name='shared' data-size='mini' checked> Shared Preferences</br>";
+        String serialization = "<input type='checkbox' name='serialization' data-size='mini' checked> Serialization</br>";
+        String crypto = "<input type='checkbox' name='crypto' data-size='mini' checked> Crypto</br>";
+        String hash = "<input type='checkbox' name='hash' data-size='mini' checked> Hash</br>";
+        String sqlite = "<input type='checkbox' name='sqlite' data-size='mini' checked> SQLite</br>";
+        String http = "<input type='checkbox' name='http' data-size='mini' checked> HTTP</br>";
+        String filesystem = "<input type='checkbox' name='filesystem' data-size='mini' checked> File System</br>";
+        String misc = "<input type='checkbox' name='misc' data-size='mini' checked> Misc.</br>";
+        String webview = "<input type='checkbox' name='webview' data-size='mini' checked> WebView</br>";
+        String ipc = "<input type='checkbox' name='ipc' data-size='mini' checked> IPC</br>";
+        String phooks = "<input type='checkbox' name='phooks' data-size='mini' checked> + Hooks</br>";
+
+        StringBuilder sb = new StringBuilder();
+
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_SHAREDP, true)) {
+            shared = "<input type='checkbox' name='shared' data-size='mini' unchecked>  Shared Preferences</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_SERIALIZATION, true)) {
+            serialization = "<input type='checkbox' name='serialization' data-size='mini' unchecked> Serialization</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_CRYPTO, true)) {
+            crypto = "<input type='checkbox' name='crypto' data-size='mini' unchecked> Crypto</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_HASH, true)) {
+            hash = "<input type='checkbox' name='hash' data-size='mini' unchecked> Hash</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_SQLITE, true)) {
+            sqlite = "<input type='checkbox' name='sqlite' data-size='mini' unchecked> SQLite</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_HTTP, true)) {
+            http = "<input type='checkbox' name='http' data-size='mini' unchecked> HTTP</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_FS, true)) {
+            filesystem = "<input type='checkbox' name='filesystem' data-size='mini' unchecked> File System</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_MISC, true)) {
+            misc = "<input type='checkbox' name='misc' data-size='mini' unchecked> Misc.</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_WV, true)) {
+            webview = "<input type='checkbox' name='webview' data-size='mini' unchecked> WebView</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_IPC, true)) {
+            ipc = "<input type='checkbox' name='ipc' data-size='mini' unchecked> IPC</br>";
+        }
+        if (!mPrefs.getBoolean(Config.SP_TAB_ENABLE_PHOOKS, true)) {
+            phooks = "<input type='checkbox' name='phooks' data-size='mini' unchecked> + Hooks</br>";
+        }
+        return sb.append("<div class=\"col-md-6\" style=\"line-height:200%;\">").append(shared).append(serialization).append(crypto).append(hash).append(sqlite).append(http).append("</div><div class=\"col-md-6\" style=\"line-height:200%;\">")
+                .append(filesystem).append(misc).append(webview).append(ipc).append(phooks).append("</div>").toString();
+    }
+
+
     //ACTIONS
 
     public Response takeScreenshot() {
@@ -693,7 +1155,7 @@ public class WebServer extends NanoHTTPD {
         try {
             FileInputStream f = new FileInputStream(absolutePath);
             File file = new File(absolutePath);
-            Response res = new Response(Response.Status.OK, "image/png", f, (int) file.length());
+            Response res = newChunkedResponse(Response.Status.OK, "image/png", f);//new Response(Response.Status.OK, "image/png", f, (int) file.length());
             res.addHeader("Content-Disposition", "attachment;filename=" + fileName);
             return res;
         } catch (FileNotFoundException e) {
@@ -710,7 +1172,7 @@ public class WebServer extends NanoHTTPD {
 
         String sdcardPath = Environment.getExternalStorageDirectory().getAbsolutePath();
 
-        if(new File("/storage/emulated/legacy").exists()){
+        if(new File(sdcardPath + Config.P_ROOT ).exists() && new File("/storage/emulated/legacy").exists()){
             sdcardPath = "/storage/emulated/legacy";
         }
 
@@ -719,7 +1181,7 @@ public class WebServer extends NanoHTTPD {
         try {
             FileInputStream f = new FileInputStream(absolutePath);
             File file = new File(absolutePath);
-            Response res = new Response(Response.Status.OK, "application/octet-stream", f, (int) file.length());
+            Response res = newChunkedResponse(Response.Status.OK, "application/octet-stream", f);//new Response(Response.Status.OK, "application/octet-stream", f, (int) file.length());
             res.addHeader("Content-Disposition", "attachment;filename=" + filename);
 
             file.delete();
@@ -748,7 +1210,7 @@ public class WebServer extends NanoHTTPD {
 
             FileInputStream f = new FileInputStream(fullZipPath);
             File file = new File(fullZipPath);
-            Response res = new Response(Response.Status.OK, "application/zip", f, (int) file.length());
+            Response res = newChunkedResponse(Response.Status.OK, "application/zip", f);//new Response(Response.Status.OK, "application/zip", f, (int) file.length());
             res.addHeader("Content-Disposition", "attachment;filename=" + file.getName());
 
             return res;
@@ -764,7 +1226,7 @@ public class WebServer extends NanoHTTPD {
         try {
             FileInputStream f = new FileInputStream(absolutePath);
             File file = new File(absolutePath);
-            Response res = new Response(Response.Status.OK, "application/vnd.android.package-archive", f, (int) file.length());
+            Response res = newChunkedResponse(Response.Status.OK, "application/vnd.android.package-archive", f);//new Response(Response.Status.OK, "application/vnd.android.package-archive", f, (int) file.length());
             String appName = mPrefs.getString(Config.SP_PACKAGE, "") + ".apk";
             res.addHeader("Content-Disposition", "attachment;filename=" + appName);
             return res;
@@ -914,384 +1376,525 @@ public class WebServer extends NanoHTTPD {
 
     //HOOKS TABS
 
-    public String hooksContent(String type) {
+    public String hooksContent(String type, int count) {
 
         String html = "";
-
+        int countTmp = 0;
         switch (type) {
             case "serialization": {
                 html = FileUtil.readFromFile(mPrefs, SERIALIZATION).replace(SerializationHook.TAG, "");
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
+
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
 
 
-                    if (x[i].length() > 170) {
-                        String len170 = x[i].substring(0, 135);
-                        String rest = x[i].substring(135);
-                        x[i] = "<div class=\"collapse-group\"> <span class=\"label label-info\">" + (i + 1) + "</span>  " + len170 +
-                                "<div class=\"collapse\"><div class=\"breakWord\">" + rest + "</div></div><a class=\"a\" href=\"#\"> &raquo;</a></div>";
-                        continue;
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
+
+                        if (x[i].length() > 170) {
+                            String len170 = x[i].substring(0, 135);
+                            String rest = x[i].substring(135);
+                            x[i] = "<div class=\"collapse-group\"> <span class=\"label label-info\">" + (i + 1) + "</span>  " + len170 +
+                                    "<div class=\"collapse\"><div class=\"breakWord\">" + rest + "</div></div><a class=\"a\" href=\"#\"> &raquo;</a></div>";
+                            continue;
+                        }
+                        x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + x[i] + "</br>";
+
                     }
-                    x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + x[i] + "</br>";
+
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i]);
+                    }
+
+                    //need load from here for callapse work correctaly
+                    String script = "<script>$(document).ready(function() {" +
+                            "$('a').on('click', function(e) {" +
+                            "                    e.preventDefault();" +
+                            "                    var $this = $(this);" +
+                            "                    var $collapse = $this.closest('.collapse-group').find('.collapse');" +
+                            "                    $collapse.collapse('toggle');" +
+                            "                });" +
+                            "});</script>";
+                    sb.append(script);
+
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
+                    }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i]);
-                }
-
-                //need load from here for callapse work correctaly
-                String script = "<script>$(document).ready(function() {" +
-                        "$('a').on('click', function(e) {" +
-                        "                    e.preventDefault();" +
-                        "                    var $this = $(this);" +
-                        "                    var $collapse = $this.closest('.collapse-group').find('.collapse');" +
-                        "                    $collapse.collapse('toggle');" +
-                        "                });" +
-                        "});</script>";
-                sb.append(script);
-                html = sb.toString();
-
                 break;
             }
             case "fs": {
                 html = FileUtil.readFromFile(mPrefs, FILESYSTEM).replace(FileSystemHook.TAG, "");
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
-                    x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + x[i];
+
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
+                        x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + x[i];
+
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
+                    }
+
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i] + "</br>");
+                    }
+
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
+                    }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i] + "</br>");
-                }
-
-                html = sb.toString();
                 break;
             }
             case "misc": {
                 html = FileUtil.readFromFile(mPrefs, MISC).replace(MiscHook.TAG, "");
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
+                        if (x[i].length() > 170) {
+                            x[i] = "<div class=\"breakWord\"><span class=\"label label-info\"> " + (i + 1) + "</span>  " + x[i] + "</div>";
+                        } else {
+                            x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i]) + "</br>";
+                        }
 
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
-                    if (x[i].length() > 170) {
-                        x[i] = "<div class=\"breakWord\"><span class=\"label label-info\"> " + (i + 1) + "</span>  " + x[i]+ "</div>";
-                    }else {
-                        x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + x[i]+"</br>";
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
+                    }
+
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i]);
+                    }
+
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
                     }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i]);
-                }
-
-                html = sb.toString();
-
                 break;
             }
             case "http": {
                 html = FileUtil.readFromFile(mPrefs, HTTP).replace(HttpHook.TAG, "");
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
 
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
 
+                        if (x[i].length() > 170) {
+                            x[i] = "<div class=\"breakWord\"><span class=\"label label-info\">" + (i + 1) + "</span> " + x[i] + "</div>";
+                        } else {
 
+                            String color = "label-info";
+                            if (x[i].contains("Possible pinning")) {
+                                color = "label-danger";
+                            }
 
-                    if (x[i].length() > 170) {
-                        x[i] = "<div class=\"breakWord\"><span class=\"label label-info\">" + (i + 1) + "</span> " + x[i]+ "</div>";
-                    }else {
-
-                        String color = "label-info";
-                        if(x[i].contains("Possible pinning")){
-                            color = "label-danger";
+                            x[i] = "<span class=\"label " + color + "\">" + (i + 1) + "</span> " + Html.escapeHtml(x[i]) + "</br>";
+                        }
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
                         }
 
-                        x[i] = "<span class=\"label "+color+"\">" + (i + 1) + "</span> " + x[i] +"</br>";
                     }
 
+                    List<String> ls = Arrays.asList(x);
 
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i]);
+                    }
+
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
+                    }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i]);
-                }
-
-                html = sb.toString();
-
                 break;
             }
             case "wv": {
                 html = FileUtil.readFromFile(mPrefs, WEBVIEW).replace(WebViewHook.TAG, "");
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
+                        if (x[i].contains("addJavascriptInterface(Object, ")) {
 
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
-                    if (x[i].contains("addJavascriptInterface(Object, ")) {
+                            x[i] = "<a href=\"#\" role=\"button\" class=\"btn popovers\" data-toggle=\"popover\" " +
+                                    "title=\"\" data-content=\"" + "Injects the supplied Java object into this WebView. " +
+                                    "The object is injected into the JavaScript context of the main frame, " +
+                                    "using the supplied name. This allows the Java object's methods to " +
+                                    "be accessed from JavaScript. <a href='http://developer.android.com/intl/pt-br/reference/android/webkit/WebView.html#addJavascriptInterface(java.lang.Object, java.lang.String)' target='_blank' title='link'> read more.</a>\">" + x[i] + " </a>";
+                        } else {
+                            x[i] = x[i];
+                        }
 
-                        x[i] = "<a href=\"#\" role=\"button\" class=\"btn popovers\" data-toggle=\"popover\" " +
-                                "title=\"\" data-content=\"" + "Injects the supplied Java object into this WebView. " +
-                                "The object is injected into the JavaScript context of the main frame, " +
-                                "using the supplied name. This allows the Java object's methods to " +
-                                "be accessed from JavaScript. <a href='http://developer.android.com/intl/pt-br/reference/android/webkit/WebView.html#addJavascriptInterface(java.lang.Object, java.lang.String)' target='_blank' title='link'> read more.</a>\">" + x[i] + " </a>";
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
+                    }
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (String aX : x) {
+                        sb.append(aX + "</br>");
+                    }
+
+                    String script = "<script>$(document).ready(function() {" +
+                            "$('[data-toggle=popover]').popover({html:true})" +
+                            "});</script>";
+
+                    sb.append(script);
+
+                    if (count == -1) {
+                        html = sb.toString();
                     } else {
-                        x[i] = x[i];
+                        html = "" + countTmp;
                     }
                 }
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (String aX : x) {
-                    sb.append(aX + "</br>");
-                }
-
-                String script = "<script>$(document).ready(function() {" +
-                        "$('[data-toggle=popover]').popover({html:true})" +
-                        "});</script>";
-
-                sb.append(script);
-
-                html = sb.toString();
-
                 break;
             }
             case "ipc": {
                 html = FileUtil.readFromFile(mPrefs, IPC).replace(IPCHook.TAG, "");
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
+                        x[i] = "<span class=\"label label-default\">" + (i + 1) + "</span>   " + x[i];
 
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
-                    x[i] = "<span class=\"label label-default\">" + (i + 1) + "</span>   " + x[i];
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
+                    }
+
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i] + "</br>");
+                    }
+
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
+                    }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i] + "</br>");
-                }
-
-                html = sb.toString();
-
                 break;
             }
             case "crypto": {
                 html = FileUtil.readFromFile(mPrefs, CRYPTO).replace(CryptoHook.TAG, "");
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
 
-                String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
 
-                for (int i = 0; i < x.length; i++) {
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
+
+                        if (x[i].length() > 170) {
+                            String len170 = x[i].substring(0, 135);
+                            String rest = x[i].substring(135);
+                            x[i] = "<div class=\"collapse-group\"> <span class=\"label label-info\">" + (i + 1) + "</span>  " + len170 +
+                                    "<div class=\"collapse\"><p class=\"breakWord\">" + rest + "</p></div><a class=\"a\" href=\"#\"> &raquo;</a></div>";
+                            continue;
+                        }
+                        x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i]) + "</br>";
 
 
-                    if (x[i].length() > 170) {
-                        String len170 = x[i].substring(0, 135);
-                        String rest = x[i].substring(135);
-                        x[i] = "<div class=\"collapse-group\"> <span class=\"label label-info\">" + (i + 1) + "</span>  " + len170 +
-                                "<div class=\"collapse\"><p class=\"breakWord\">" + rest + "</p></div><a class=\"a\" href=\"#\"> &raquo;</a></div>";
-                        continue;
                     }
-                    x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + x[i] + "</br>";
+
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i]);
+                    }
+
+                    //need load from here for callapse work correctaly
+                    String script = "<script>$(document).ready(function() {" +
+                            "$('a').on('click', function(e) {" +
+                            "                    e.preventDefault();" +
+                            "                    var $this = $(this);" +
+                            "                    var $collapse = $this.closest('.collapse-group').find('.collapse');" +
+                            "                    $collapse.collapse('toggle');" +
+                            "                });" +
+                            "});</script>";
+                    sb.append(script);
+
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
+                    }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i]);
-                }
-
-                //need load from here for callapse work correctaly
-                String script = "<script>$(document).ready(function() {" +
-                        "$('a').on('click', function(e) {" +
-                        "                    e.preventDefault();" +
-                        "                    var $this = $(this);" +
-                        "                    var $collapse = $this.closest('.collapse-group').find('.collapse');" +
-                        "                    $collapse.collapse('toggle');" +
-                        "                });" +
-                        "});</script>";
-                sb.append(script);
-                html = sb.toString();
-
                 break;
             }
             case "prefs": {
                 html = FileUtil.readFromFile(mPrefs, PREFS).replace(SharedPrefsHook.TAG, "");
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
 
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
+                        String color = "danger";
+                        if (x[i].contains("GET[")) {
+                            color = "info";
+                        } else if (x[i].contains("CONTAINS[")) {
+                            color = "warning";
+                        } else if (x[i].contains("PUT[")) {
+                            color = "danger";
+                        }
 
-                    String color = "label-danger";
-                    if (x[i].contains("GET[")) {
-                        color = "label-info";
-                    } else if (x[i].contains("CONTAINS[")) {
-                        color = "label-warning";
-                    } else if (x[i].contains("PUT[")) {
-                        color = "label-danger";
+                        if (x[i].length() > 170) {
+                            x[i] = "<tr><td><div class=\"breakWord\"><span class=\"label label-" + color + "\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i]) + "</div></td></tr>";
+                        } else {
+                            x[i] = "<tr><td><span class=\"label label-" + color + "\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i]) + "</br></td></tr>";
+                        }
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
                     }
 
-                    if (x[i].length() > 170) {
-                        x[i] = "<div class=\"breakWord\"><span class=\"label "+color+"\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i])+"</div>";
-                    }else{
-                        x[i] = "<span class=\"label "+color+"\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i])+"</br>";
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+                    String tableBefore = "<table class=\"table\"><tbody>";
+                    String tableAfter = "</tbody></table>";
+                    //sb.append(tableBefore);
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i]);
                     }
-
+                    //sb.append(tableAfter);
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
+                    }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 2000)
-                        sb.append(x[i]);
-                }
-
-                html = sb.toString();
-
                 break;
             }
             case "hash": {
 
                 html = FileUtil.readFromFile(mPrefs, HASH).replace(HashHook.TAG, "");
-                String[] x = html.split("</br>");
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
 
-                for (int i = 0; i < x.length; i++) {
+                    for (int i = 0; i < x.length; i++) {
 
-                    if (x[i].length() > 170) {
-                        String len170 = x[i].substring(0, 135);
-                        String rest = x[i].substring(135);
-                        x[i] = "<div class=\"collapse-group\"> <span class=\"label label-info\">" + (i + 1) + "</span>  " + len170 +
-                                "<div class=\"collapse\"><p class=\"breakWord\">" + rest + "</p></div><a class=\"a\" href=\"#\"> &raquo;</a></div>";
-                        continue;
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
+
+                        if (x[i].length() > 170) {
+                            String len170 = x[i].substring(0, 135);
+                            String rest = x[i].substring(135);
+                            x[i] = "<div class=\"collapse-group\"> <span class=\"label label-info\">" + (i + 1) + "</span>  " + len170 +
+                                    "<div class=\"collapse\"><p class=\"breakWord\">" + rest + "</p></div><a class=\"a\" href=\"#\"> &raquo;</a></div>";
+                            continue;
+                        }
+                        x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i]) + "</br>";
+
+
                     }
-                    x[i] = "<span class=\"label label-info\">" + (i + 1) + "</span>   " + x[i] + "</br>";
+
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i]);
+                    }
+
+                    //need load from here for callapse work correctaly
+                    String script = "<script>$(document).ready(function() {" +
+                            "$('a').on('click', function(e) {" +
+                            "                    e.preventDefault();" +
+                            "                    var $this = $(this);" +
+                            "                    var $collapse = $this.closest('.collapse-group').find('.collapse');" +
+                            "                    $collapse.collapse('toggle');" +
+                            "                });" +
+                            "});</script>";
+                    sb.append(script);
+
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
+                    }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i]);
-                }
-
-                //need load from here for callapse work correctaly
-                String script = "<script>$(document).ready(function() {" +
-                        "$('a').on('click', function(e) {" +
-                        "                    e.preventDefault();" +
-                        "                    var $this = $(this);" +
-                        "                    var $collapse = $this.closest('.collapse-group').find('.collapse');" +
-                        "                    $collapse.collapse('toggle');" +
-                        "                });" +
-                        "});</script>";
-                sb.append(script);
-                html = sb.toString();
-
-
                 break;
             }
             case "sqlite": {
                 html = FileUtil.readFromFile(mPrefs, SQLITE).replace(SQLiteHook.TAG, "");
 
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
 
-                    String color;
-                    if (x[i].contains("INSERT INTO")) {
-                        color = "label-info";
-                    } else if (x[i].contains("UPDATE")) {
-                        color = "label-warning";
-                    } else if (x[i].contains("execSQL(")) {
-                        color = "label-danger";
-                    }else if (x[i].contains("SELECT")) {
-                        color = "label-success";
-                        x[i].replace("\n", "</br>");
-                    }else{
-                        color = "label-default";
+                        String color;
+                        if (x[i].contains("INSERT INTO")) {
+                            color = "label-info";
+                        } else if (x[i].contains("UPDATE")) {
+                            color = "label-warning";
+                        } else if (x[i].contains("execSQL(")) {
+                            color = "label-danger";
+                        } else if (x[i].contains("SELECT")) {
+                            color = "label-success";
+                            x[i].replace("\n", "</br>");
+                        } else {
+                            color = "label-default";
+                        }
+
+                        if (x[i].length() > 170) {
+                            x[i] = "<div class=\"breakWord\"><span class=\"label " + color + "\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i]) + "</div>";
+                        } else {
+                            x[i] = "<span class=\"label " + color + "\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i]) + "</br>";
+                        }
+
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
                     }
 
-                    if (x[i].length() > 170) {
-                        x[i] = "<div class=\"breakWord\"><span class=\"label "+color+"\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i])+"</div>";
-                    }else{
-                        x[i] = "<span class=\"label "+color+"\">" + (i + 1) + "</span>   " + Html.escapeHtml(x[i])+"</br>";
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i]);
+                    }
+
+                    if (count == -1) {
+                        html = sb.toString().replace("</br></br>", "</br>");
+                    } else {
+                        html = "" + countTmp;
                     }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i]);
-                }
-
-                html = sb.toString().replace("</br></br>", "</br>");
 
                 break;
             }
             case "userhooks": {
                 html = FileUtil.readFromFile(mPrefs, USERHOOKS).replace(UserHooks.TAG, "");
 
-                String[] x = html.split("</br>");
-                for (int i = 0; i < x.length; i++) {
-                    x[i] = "<span class=\"label label-default\">" + (i + 1) + "</span>   " + x[i];
+                if(!html.equals("")) {
+                    String[] x = html.split("</br>");
+                    for (int i = 0; i < x.length; i++) {
+
+                        if (x[i].length() > 470) {
+                            String len300 = x[i].substring(0, 400);
+                            String rest = x[i].substring(400);
+
+                            x[i] = "<div class=\"collapse-group\"> <div class=\"breakWord\"><span class=\"label label-default\">" + (i + 1) + "</span>   " + len300 + "</div>" +
+                                    "<div class=\"collapse\"><p class=\"breakWord\">" + rest + "</p></div><a class=\"a\" href=\"#\"> &raquo;</a></div>";
+
+                        } else {
+                            x[i] = "<span class=\"label label-default\">" + (i + 1) + "</span>   " + x[i];
+                        }
+
+                        if ((i + 1) > count) {
+                            countTmp = (i + 1);
+                        } else {
+                            countTmp = count;
+                        }
+                    }
+
+                    List<String> ls = Arrays.asList(x);
+
+                    Collections.reverse(ls);
+                    x = (String[]) ls.toArray();
+                    StringBuilder sb = new StringBuilder();
+
+                    for (int i = 0; i < x.length; i++) {
+                        if (i < 500)
+                            sb.append(x[i] + "</br>");
+                    }
+                    //need load from here for callapse work correctaly
+                    String script = "<script>$(document).ready(function() {" +
+                            "$('a').on('click', function(e) {" +
+                            "                    e.preventDefault();" +
+                            "                    var $this = $(this);" +
+                            "                    var $collapse = $this.closest('.collapse-group').find('.collapse');" +
+                            "                    $collapse.collapse('toggle');" +
+                            "                });" +
+                            "});</script>";
+                    sb.append(script);
+                    if (count == -1) {
+                        html = sb.toString();
+                    } else {
+                        html = "" + countTmp;
+                    }
                 }
-
-                List<String> ls = Arrays.asList(x);
-
-                Collections.reverse(ls);
-                x = (String[]) ls.toArray();
-                StringBuilder sb = new StringBuilder();
-
-                for (int i = 0; i < x.length; i++) {
-                    if (i < 1000)
-                        sb.append(x[i] + "</br>");
-                }
-
-                html = sb.toString();
-
                 break;
             }
         }
@@ -1308,5 +1911,4 @@ public class WebServer extends NanoHTTPD {
     public static boolean isModuleEnabled() {
         return false;
     }
-
 }

@@ -24,10 +24,21 @@ import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import mobi.acpm.inspeckage.Module;
+
 /**
  * Created by acpm on 29/11/15.
  */
 public class FileUtil {
+
+    public static void fixSharedPreference(Context context) {
+
+        File folder = new File(Config.P_INSPECKAGE_PATH);
+        folder.setExecutable(true, false);
+
+        String mPrefFile = Config.P_INSPECKAGE_PATH + Config.P_SHARED_PATH + Module.PREFS + ".xml";
+        (new File(mPrefFile)).setReadable(true, false);
+    }
 
     public static void writeToFile(SharedPreferences prefs, String data, FileType ft, String name) {
 
@@ -40,7 +51,7 @@ public class FileUtil {
             } else {
                 absolutePath = prefs.getString(Config.SP_DATA_DIR, null)+Config.P_ROOT;
             }
-
+            boolean append = true;
             if (ft != null) {
                 switch (ft) {
                     case SERIALIZATION:
@@ -104,6 +115,13 @@ public class FileUtil {
                         absolutePath += Config.P_USERHOOKS;
                         data = data + "</br>";
                         break;
+                    case APP_STRUCT:
+                        absolutePath += Config.P_APP_STRUCT;
+                        append = false;
+                        break;
+                    case REPLACEMENT:
+                        absolutePath += Config.P_REPLACEMENT;
+                        break;
                     default:
                 }
 
@@ -117,6 +135,9 @@ public class FileUtil {
                     path.setWritable(true, false);
 
                     path.mkdirs();
+                    path.setReadable(true, false);
+                    path.setExecutable(true, false);
+                    path.setWritable(true, false);
 
                     file.createNewFile();
 
@@ -126,7 +147,7 @@ public class FileUtil {
 
                 }
 
-                FileOutputStream fOut = new FileOutputStream(file, true);
+                FileOutputStream fOut = new FileOutputStream(file, append);
                 OutputStreamWriter myOutWriter = new OutputStreamWriter(fOut);
 
                 myOutWriter.write(data);
@@ -194,6 +215,9 @@ public class FileUtil {
                     break;
                 case USERHOOKS:
                     absolutePath += Config.P_USERHOOKS; //10
+                    break;
+                case APP_STRUCT:
+                    absolutePath += Config.P_APP_STRUCT; //10
                     break;
                 default:
             }
@@ -314,21 +338,23 @@ public class FileUtil {
     static void addDir(File srcFile, ZipOutputStream zos) throws IOException {
 
         File[] files = srcFile.listFiles();
-        byte[] buffer = new byte[1024];
-        for (File file : files) {
+        if(files != null) {
+            byte[] buffer = new byte[1024];
+            for (File file : files) {
 
-            if (file.isDirectory()) {
-                addDir(file, zos);
-                continue;
+                if (file.isDirectory()) {
+                    addDir(file, zos);
+                    continue;
+                }
+                FileInputStream fis = new FileInputStream(file);
+                zos.putNextEntry(new ZipEntry(file.getName()));
+                int length;
+                while ((length = fis.read(buffer)) > 0) {
+                    zos.write(buffer, 0, length);
+                }
+                zos.closeEntry();
+                fis.close();
             }
-            FileInputStream fis = new FileInputStream(file);
-            zos.putNextEntry(new ZipEntry(file.getName()));
-            int length;
-            while ((length = fis.read(buffer)) > 0) {
-                zos.write(buffer, 0, length);
-            }
-            zos.closeEntry();
-            fis.close();
         }
     }
 
@@ -340,5 +366,55 @@ public class FileUtil {
         }
 
         fileOrDirectory.delete();
+    }
+
+    public static void deleteFile(File file) {
+        file.delete();
+    }
+
+    public static void writeJsonFile(SharedPreferences prefs, String data, String name) {
+
+        try {
+
+            String absolutePath;
+
+            if (prefs.getBoolean(Config.SP_HAS_W_PERMISSION, false)) {
+                absolutePath = Environment.getExternalStorageDirectory().getAbsolutePath() + Config.P_ROOT + "/" + prefs.getString(Config.SP_PACKAGE, "");
+            } else {
+                absolutePath = prefs.getString(Config.SP_DATA_DIR, null) + Config.P_ROOT;
+            }
+
+            absolutePath += "/"+name;
+            File file = new File(absolutePath);
+
+            if (!file.exists()) {
+
+                File path = new File(String.valueOf(file.getParentFile()));
+                path.setReadable(true, false);
+                path.setExecutable(true, false);
+                path.setWritable(true, false);
+
+                path.mkdirs();
+                path.setReadable(true, false);
+                path.setExecutable(true, false);
+                path.setWritable(true, false);
+
+                file.createNewFile();
+
+                file.setReadable(true, false);
+                file.setExecutable(true, false);
+                file.setWritable(true, false);
+
+            }
+
+            FileOutputStream fOut = new FileOutputStream(file, false);
+            OutputStreamWriter myOutWriter = new OutputStreamWriter(fOut);
+
+            myOutWriter.write(data);
+            myOutWriter.close();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 }

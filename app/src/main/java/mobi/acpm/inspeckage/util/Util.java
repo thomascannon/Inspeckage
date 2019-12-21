@@ -3,6 +3,10 @@ package mobi.acpm.inspeckage.util;
 import android.app.ActivityManager;
 import android.app.NotificationManager;
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
 import android.os.Environment;
 import android.support.v4.app.TaskStackBuilder;
 import android.support.v7.app.NotificationCompat;
@@ -14,6 +18,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.Locale;
@@ -54,6 +59,8 @@ public class Util {
     }
 
     public static String byteArrayToString(byte[] input) {
+        if(input==null)
+            return "";
         String out = new String(input);
         int tmp = 0;
         for (int i = 0; i < out.length(); i++) {
@@ -115,7 +122,7 @@ public class Util {
 
         android.support.v4.app.NotificationCompat.Builder mBuilder =
                 new NotificationCompat.Builder(mContext)
-                        .setSmallIcon(R.drawable.ic_check_box_outline_blank_24dp)
+                        .setSmallIcon(R.drawable.inspectorw)
                         .setContentTitle("Inspeckage")
                         .setContentText(info);
 
@@ -132,7 +139,8 @@ public class Util {
             sh = Runtime.getRuntime().exec("su", null, null);
             OutputStream os = sh.getOutputStream();
             String path = Environment.getExternalStorageDirectory().getAbsolutePath();
-            if(new File("/storage/emulated/legacy").exists()){
+
+            if(new File(path + Config.P_ROOT ).exists() && new File("/storage/emulated/legacy").exists()){
                 path = "/storage/emulated/legacy";
             }
             os.write(("/system/bin/screencap -p " + path + Config.P_ROOT + "/" + fileName).getBytes("ASCII"));
@@ -239,5 +247,54 @@ public class Util {
             }
         }
         return false;
+    }
+
+    public static String imageToBase64(Drawable drawable)
+    {
+        Bitmap image = drawableToBitmap(drawable);
+        ByteArrayOutputStream byteArrayOS = new ByteArrayOutputStream();
+        image.compress(Bitmap.CompressFormat.PNG, 70, byteArrayOS);
+        return Base64.encodeToString(byteArrayOS.toByteArray(), Base64.DEFAULT);
+    }
+
+    public static Bitmap drawableToBitmap (Drawable drawable) {
+        Bitmap bitmap = null;
+
+        if (drawable instanceof BitmapDrawable) {
+            BitmapDrawable bitmapDrawable = (BitmapDrawable) drawable;
+            if(bitmapDrawable.getBitmap() != null) {
+                return bitmapDrawable.getBitmap();
+            }
+        }
+
+        if(drawable.getIntrinsicWidth() <= 0 || drawable.getIntrinsicHeight() <= 0) {
+            bitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888); // Single color bitmap will be created of 1x1 pixel
+        } else {
+            bitmap = Bitmap.createBitmap(drawable.getIntrinsicWidth(), drawable.getIntrinsicHeight(), Bitmap.Config.ARGB_8888);
+        }
+
+        Canvas canvas = new Canvas(bitmap);
+        drawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+        drawable.draw(canvas);
+        return bitmap;
+    }
+
+    public static int inetAddressToInt(InetAddress inetAddr)
+            throws IllegalArgumentException {
+        byte [] addr = inetAddr.getAddress();
+        return ((addr[3] & 0xff) << 24) | ((addr[2] & 0xff) << 16) |
+                ((addr[1] & 0xff) << 8) | (addr[0] & 0xff);
+    }
+
+    public static byte[] macAddressToByteArr(String mac){
+        String macAddress = mac;
+        String[] macAddressParts = macAddress.split(":");
+
+        byte[] macAddressBytes = new byte[6];
+        for(int i=0; i<6; i++){
+            Integer hex = Integer.parseInt(macAddressParts[i], 16);
+            macAddressBytes[i] = hex.byteValue();
+        }
+        return macAddressBytes;
     }
 }

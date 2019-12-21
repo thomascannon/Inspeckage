@@ -29,7 +29,8 @@ public class PackageDetail {
 
     public PackageDetail(Context context, String app) {
 
-        mPrefs = context.getSharedPreferences(Module.PREFS, context.MODE_WORLD_READABLE);
+        mPrefs = context.getSharedPreferences(Module.PREFS, context.MODE_PRIVATE);
+
         mContext = context;
         pm = context.getPackageManager();
         List<PackageInfo> plist = context.getPackageManager().getInstalledPackages(0);
@@ -345,6 +346,23 @@ public class PackageDetail {
         return String.valueOf(isDebuggable);
     }
 
+    public String allowBackup() {
+        Boolean allow = false;
+
+        if (0 != (mAppInfo.flags & ApplicationInfo.FLAG_ALLOW_BACKUP)) {
+            allow = true;
+        }
+        return String.valueOf(allow);
+    }
+
+    public String getIconBase64() {
+        String icon = "";
+        if (mAppInfo != null) {
+            icon = Util.imageToBase64(mAppInfo.loadIcon(pm));
+        }
+        return icon;
+    }
+
     public String getSharedUserId() {
         String suserid = "";
         if (mPInfo.sharedUserId != null) {
@@ -385,6 +403,7 @@ public class PackageDetail {
         sb.append("UID: " + getUID() + "\n");
         sb.append("GIDs: " + getGIDs() + "\n");
         sb.append("Is Debuggable: " + isDebuggable() + "\n");
+        sb.append("Allow Backup: " + allowBackup() + "\n");
         sb.append("Shared User ID: " + getSharedUserId() + "\n");
 
         sb.append(getRequestedPermissions());

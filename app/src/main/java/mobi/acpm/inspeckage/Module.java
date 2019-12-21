@@ -1,5 +1,12 @@
 package mobi.acpm.inspeckage;
 
+import android.app.AndroidAppHelper;
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
+
+import java.io.File;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
@@ -10,6 +17,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import mobi.acpm.inspeckage.hooks.ClipboardHook;
 import mobi.acpm.inspeckage.hooks.CryptoHook;
 import mobi.acpm.inspeckage.hooks.FileSystemHook;
+import mobi.acpm.inspeckage.hooks.FingerprintHook;
 import mobi.acpm.inspeckage.hooks.FlagSecureHook;
 import mobi.acpm.inspeckage.hooks.HashHook;
 import mobi.acpm.inspeckage.hooks.HttpHook;
@@ -20,8 +28,11 @@ import mobi.acpm.inspeckage.hooks.SQLiteHook;
 import mobi.acpm.inspeckage.hooks.SSLPinningHook;
 import mobi.acpm.inspeckage.hooks.SerializationHook;
 import mobi.acpm.inspeckage.hooks.SharedPrefsHook;
+import mobi.acpm.inspeckage.hooks.UIHook;
 import mobi.acpm.inspeckage.hooks.UserHooks;
 import mobi.acpm.inspeckage.hooks.WebViewHook;
+import mobi.acpm.inspeckage.hooks.entities.LocationHook;
+import mobi.acpm.inspeckage.util.Config;
 import mobi.acpm.inspeckage.util.FileType;
 import mobi.acpm.inspeckage.util.FileUtil;
 
@@ -49,20 +60,36 @@ public class Module extends XC_MethodHook implements IXposedHookLoadPackage, IXp
 
         sPrefs.reload();
 
-        //estes hooks tem que ocorrer na inicialização
-        //ProcessHook.initAllHooks(loadPackageParam);
-
-
         //check if this module is enable
         if (loadPackageParam.packageName.equals("mobi.acpm.inspeckage")) {
             findAndHookMethod("mobi.acpm.inspeckage.webserver.WebServer", loadPackageParam.classLoader, "isModuleEnabled", XC_MethodReplacement.returnConstant(true));
+
+            //workaround to bypass MODE_PRIVATE of shared_prefs
+            findAndHookMethod("android.app.SharedPreferencesImpl.EditorImpl", loadPackageParam.classLoader, "notifyListeners",
+                    "android.app.SharedPreferencesImpl.MemoryCommitResult", new XC_MethodHook() {
+
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            //workaround to bypass the concurrency (io)
+                            Handler handler = new Handler(Looper.getMainLooper());
+                            handler.postDelayed(new Runnable() {
+                                public void run() {
+                                    Context context = (Context) AndroidAppHelper.currentApplication();
+                                    FileUtil.fixSharedPreference(context);
+                                }
+                            }, 1000);
+                        }
+                    });
         }
+
+        if (loadPackageParam.packageName.equals("mobi.acpm.inspeckage"))
+            return;
 
         if (!loadPackageParam.packageName.equals(sPrefs.getString("package", "")))
             return;
 
-        if (loadPackageParam.packageName.equals("mobi.acpm.inspeckage"))
-            return;
+        //inspeckage needs access to the files
+        File folder = new File(sPrefs.getString(Config.SP_DATA_DIR, null));
+        folder.setExecutable(true, false);
 
         findAndHookMethod("android.util.Log", loadPackageParam.classLoader, "i",
                 String.class, String.class, new XC_MethodHook() {
@@ -105,25 +132,51 @@ public class Module extends XC_MethodHook implements IXposedHookLoadPackage, IXp
                     }
                 });
 
-        HttpHook.initAllHooks(loadPackageParam);//10
-        MiscHook.initAllHooks(loadPackageParam);//10
-        WebViewHook.initAllHooks(loadPackageParam);//8
-        ClipboardHook.initAllHooks(loadPackageParam); //1
-        CryptoHook.initAllHooks(loadPackageParam); //2
-        FileSystemHook.initAllHooks(loadPackageParam); //9
-        if (sPrefs.getBoolean("flag_secure", false)) {
-            FlagSecureHook.initAllHooks(loadPackageParam);// --
+        UIHook.initAllHooks(loadPackageParam);
+
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_HTTP,true)) {
+            HttpHook.initAllHooks(loadPackageParam);
         }
-        HashHook.initAllHooks(loadPackageParam);//3
-        IPCHook.initAllHooks(loadPackageParam);//4
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_MISC,true)) {
+            MiscHook.initAllHooks(loadPackageParam);
+            ClipboardHook.initAllHooks(loadPackageParam);
+        }
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_WV,true)) {
+            WebViewHook.initAllHooks(loadPackageParam);
+        }
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_CRYPTO,true)) {
+            CryptoHook.initAllHooks(loadPackageParam);
+        }
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_FS,true)) {
+            FileSystemHook.initAllHooks(loadPackageParam);
+        }
+        FlagSecureHook.initAllHooks(loadPackageParam);
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_HASH,true)) {
+            HashHook.initAllHooks(loadPackageParam);
+        }
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_IPC,true)) {
+            IPCHook.initAllHooks(loadPackageParam);
+        }
         ProxyHook.initAllHooks(loadPackageParam);// --
-        SharedPrefsHook.initAllHooks(loadPackageParam);//5
-        SQLiteHook.initAllHooks(loadPackageParam);//6
-        if (sPrefs.getBoolean("sslunpinning", false)) {
-            SSLPinningHook.initAllHooks(loadPackageParam);// --
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_SHAREDP,true)) {
+            SharedPrefsHook.initAllHooks(loadPackageParam);
         }
-        SerializationHook.initAllHooks(loadPackageParam);//
-        UserHooks.initAllHooks(loadPackageParam);
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_SQLITE,true)) {
+            SQLiteHook.initAllHooks(loadPackageParam);
+        }
+        SSLPinningHook.initAllHooks(loadPackageParam);// --
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_SERIALIZATION,true)) {
+            SerializationHook.initAllHooks(loadPackageParam);
+        }
+        if(sPrefs.getBoolean(Config.SP_TAB_ENABLE_PHOOKS,true)) {
+            UserHooks.initAllHooks(loadPackageParam);
+        }
+        if(sPrefs.getBoolean(Config.SP_GEOLOCATION_SW,false)) {
+            LocationHook.initAllHooks(loadPackageParam);
+        }
+        FingerprintHook.initAllHooks(loadPackageParam);
+
+        //DexUtil.saveClassesWithMethodsJson(loadPackageParam, sPrefs);
     }
 
     public static void logError(Error e){

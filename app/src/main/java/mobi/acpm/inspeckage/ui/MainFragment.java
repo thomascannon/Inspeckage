@@ -9,8 +9,9 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.graphics.Color;
 import android.net.Uri;
-import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -21,9 +22,13 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 
@@ -58,9 +63,13 @@ public class MainFragment extends Fragment {
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         try {
-            mPrefs = context.getSharedPreferences(Module.PREFS, context.MODE_WORLD_READABLE);
+            mPrefs = context.getSharedPreferences(Module.PREFS, context.MODE_PRIVATE);
 
-            startService(mPrefs.getInt(Config.SP_SERVER_PORT, 8008));
+            String host = null;
+            if(!mPrefs.getString(Config.SP_SERVER_HOST, "All interfaces").equals("All interfaces")){
+                host = mPrefs.getString(Config.SP_SERVER_HOST, "All interfaces");
+            }
+            startService(host,mPrefs.getInt(Config.SP_SERVER_PORT, 8008));
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -147,19 +156,32 @@ public class MainFragment extends Fragment {
             }
         });
 
+        loadInterfaces();
 
-        WifiManager wifiManager = (WifiManager) context.getSystemService(context.WIFI_SERVICE);
-        int ipAddress = wifiManager.getConnectionInfo().getIpAddress();
-        String formatedIp = String.format("%d.%d.%d.%d", (ipAddress & 0xff), (ipAddress >> 8 & 0xff), (ipAddress >> 16 & 0xff), (ipAddress >> 24 & 0xff));
-
-        SharedPreferences.Editor edit = mPrefs.edit();
-        edit.putString(Config.SP_SERVER_IP, formatedIp);
-        edit.apply();
+        String scheme = "http://";
+        if(mPrefs.getBoolean(Config.SP_SWITCH_AUTH, false)) {
+            scheme = "https://";
+        }
 
         String port = String.valueOf(mPrefs.getInt(Config.SP_SERVER_PORT, 8008));
+        String host = "";
+        if(mPrefs.getString(Config.SP_SERVER_HOST, "All interfaces").equals("All interfaces")){
+            String[] adds = mPrefs.getString(Config.SP_SERVER_INTERFACES, "--").split(",");
+            for(int i=0; i<adds.length; i++){
+                if(!adds[i].equals("All interfaces"))
+                    host = host + scheme + adds[i] + ":" + port+"\n";
+            }
+        }else{
+            String ip = mPrefs.getString(Config.SP_SERVER_HOST, "127.0.0.1");
+            host = scheme + ip + ":" + port;
+
+            SharedPreferences.Editor edit = mPrefs.edit();
+            edit.putString(Config.SP_SERVER_IP, ip);
+            edit.apply();
+        }
 
         TextView txtHost = (TextView) view.findViewById(R.id.txtHost);
-        txtHost.setText("http://" + formatedIp + ":" + port);
+        txtHost.setText(host);
 
         TextView txtAdb = (TextView) view.findViewById(R.id.txtAdb);
         txtAdb.setText("adb forward tcp:"+port+" tcp:"+port);
@@ -171,6 +193,29 @@ public class MainFragment extends Fragment {
         return view;
     }
 
+    public void loadInterfaces(){
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("All interfaces,");
+        try {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
+                NetworkInterface netInterface = en.nextElement();
+                for (Enumeration<InetAddress> enumIpAddr = netInterface.getInetAddresses(); enumIpAddr.hasMoreElements();) {
+                    InetAddress inetAddress = enumIpAddr.nextElement();
+                    String address = inetAddress.getHostAddress();
+                    boolean isIPv4 = address.indexOf(':') < 0;
+                    if (isIPv4) {
+                        sb.append(address+",");
+                    }
+                }
+            }
+        } catch (SocketException ex) {
+            Log.e("Inspeckage_Error", ex.toString());
+        }
+        SharedPreferences.Editor edit = mPrefs.edit();
+        edit.putString(Config.SP_SERVER_INTERFACES, sb.toString().substring(0,sb.length()-1));
+        edit.apply();
+    }
     @Override
     public void onDetach() {
         super.onDetach();
@@ -194,9 +239,10 @@ public class MainFragment extends Fragment {
 
     //----------------------------------------------METHODS--------------------------------------
 
-    public void startService(int port) {
+    public void startService(String host, int port) {
         Intent i = new Intent(context, InspeckageService.class);
         i.putExtra("port", port);
+        i.putExtra("host", host);
 
         context.startService(i);
     }
@@ -262,14 +308,17 @@ public class MainFragment extends Fragment {
         pd = new PackageDetail(context, pkg);
 
         edit.putBoolean(Config.SP_HAS_W_PERMISSION, false);
-        if (pd.getRequestedPermissions().contains("android.permission.WRITE_EXTERNAL_STORAGE")) {
+        if (pd.getRequestedPermissions().contains("android.permission.WRITE_EXTERNAL_STORAGE") &&
+                Build.VERSION.SDK_INT < 23) {
             edit.putBoolean(Config.SP_HAS_W_PERMISSION, true);
         }
 
         edit.putString(Config.SP_APP_NAME, pd.getAppName());
+        edit.putString(Config.SP_APP_ICON_BASE64, pd.getIconBase64());
         edit.putString(Config.SP_PROCESS_NAME, pd.getProcessName());
         edit.putString(Config.SP_APP_VERSION, pd.getVersion());
         edit.putString(Config.SP_DEBUGGABLE, pd.isDebuggable());
+        edit.putString(Config.SP_ALLOW_BACKUP, pd.allowBackup());
         edit.putString(Config.SP_APK_DIR, pd.getApkDir());
         edit.putString(Config.SP_UID, pd.getUID());
         edit.putString(Config.SP_GIDS, pd.getGIDs());
